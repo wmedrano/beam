@@ -23,6 +23,8 @@ sdks/**/vendor/**/*
 runners/**/vendor/**/*
 **/.gradletasknamecache
 **/generated/*
+!sdks/rust/crates/beam-model/src/generated/*
+sdks/rust/.tools/**/*
 /go.mod
 /go.sum
 
@@ -86,6 +88,7 @@ sdks/python/coverage.xml
 **/.apt_generated/**/*
 **/.settings/**/*
 **/.gitignore
+!sdks/rust/.gitignore
 
 # Ignore Visual Studio Code files.
 **/.vscode/**/*

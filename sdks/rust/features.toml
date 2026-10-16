@@ -1,0 +1,116 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[sdk]
+status = "native Prism PROCESS prototype"
+prototype_local_acceptance_passed = true
+version = "0.1.0-unpublished"
+model_revision = "1a3f1015445246911b4cd890e3686cc7ad2f2902"
+tested_target = "x86_64-unknown-linux-gnu"
+msrv = "1.96"
+contributor_toolchain = "1.96.1"
+m0_complete = true
+m1_complete = false
+m2_complete = false
+
+[tested]
+typed_handles = true
+explicit_dofn_registry = true
+create = true
+single_output_pardo = true
+flatten = true
+group_by_key = true
+sum_i64_wrapping = true
+distributed_multiset_assertions = true
+global_windows_default_trigger_zero_lateness = true
+metadata_preservation = true
+fragmented_and_coalesced_coder_input = true
+process_boot_provision_control_data_logging = true
+descriptor_fetch = true
+bounded_compute_pool = true
+input_spooling = true
+attempted_and_committed_counter_queries = true
+short_id_metrics_when_advertised = true
+job_wait_and_cancel_request = true
+user_failure_panic_identity_config_rejection = true
+standalone_package_consumer = true
+fallible_grouped_iteration = true
+partial_and_independent_group_consumption = true
+hot_key_spooling_80_mib_acceptance = true
+finish_bundle_outputs = true
+user_info_logging_with_bundle_transform_context = true
+native_local_utf8_text_io = true
+bounded_unary_job_rpcs = true
+interleaved_input_and_blocked_output_tests = true
+register_cache_limits_and_atomicity = true
+
+[protocol_tests]
+go_beam_apis = true
+prism_job_service = true
+unary = true
+server_streaming = true
+bidirectional_streaming = true
+worker_metadata = true
+status = true
+deadline_cancellation = true
+backpressure_with_unrelated_rpc = true
+mutual_tls_handshake_and_negative_cases = true
+unknown_field_retention = true
+well_known_types = true
+custom_enum_option_urn_generation = true
+official_grpc_client_deadline_gate = false
+
+[runners.prism_process]
+tested = true
+requires_checkout_fixes = ["PROCESS worker ID argument", "output data fragments across message boundaries"]
+acceptance = "tools/test-prism.sh"
+cases = 23
+
+[runners.prism_docker]
+tested = false
+enabled = false
+
+[runners.flink_batch]
+tested = false
+enabled = false
+
+[coders]
+reference_cases = 111
+supported = ["bytes", "string_utf8", "bool", "varint", "double", "kv", "iterable", "nullable", "length_prefix", "global_window", "interval_window", "windowed_value"]
+unsupported = ["row", "custom_window", "param_windowed_value", "sharded_key", "state_backed_iterable", "timer"]
+
+[future_native]
+register_real_runner_acceptance = true
+general_custom_coder_urns_and_factories = true
+richer_pipeline_options = true
+long_running_whole_worker_stress = true
+comparative_performance_baselines = true
+hosted_ci_observation = true
+
+[optional_deployment]
+application_container_distribution = true
+artifact_staging_and_retrieval = true
+cross_platform_build_manifests = true
+authenticated_remote_sdk_submission = true
+flink_batch_acceptance = true
+worker_failure_retry_acceptance = true
+
+[out_of_scope]
+standalone_java_protocol_gate = true
+java_expansion = true
+cross_language_io = true
+portable_row_schema_subset = true
+expansion_and_schema_transforms = true
+streaming_state_timers_side_inputs_sdf = true

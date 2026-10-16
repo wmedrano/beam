@@ -882,44 +882,45 @@ func (em *ElementManager) PersistBundle(rb RunBundle, col2Coders map[string]PCol
 		info := col2Coders[output]
 		var newPending []element
 		slog.Debug("PersistBundle: processing output", "bundle", rb, slog.String("output", output))
+		// Fn Data messages are arbitrary byte chunks, not element boundaries.
+		// Read the complete output stream without concatenating another copy.
+		readers := make([]io.Reader, 0, len(data))
 		for _, datum := range data {
-			buf := bytes.NewBuffer(datum)
-			if len(datum) == 0 {
-				panic(fmt.Sprintf("zero length data for %v: ", output))
+			readers = append(readers, bytes.NewReader(datum))
+		}
+		buf := io.MultiReader(readers...)
+		for {
+			var rawBytes bytes.Buffer
+			tee := io.TeeReader(buf, &rawBytes)
+			ws, et, pn, err := exec.DecodeWindowedValueHeader(info.WDec, tee)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				slog.Error("PersistBundle: error decoding watermarks", "error", err, "bundle", rb, slog.String("output", output))
+				panic("error decoding watermarks")
 			}
-			for {
-				var rawBytes bytes.Buffer
-				tee := io.TeeReader(buf, &rawBytes)
-				ws, et, pn, err := exec.DecodeWindowedValueHeader(info.WDec, tee)
-				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					slog.Error("PersistBundle: error decoding watermarks", "error", err, "bundle", rb, slog.String("output", output))
-					panic("error decoding watermarks")
-				}
-				if len(ws) == 0 {
-					slog.Warn("PersistBundle: sdk provided a windowed value header 0 windows", "bundle", rb)
-				}
-				// TODO: Optimize unnecessary copies. This is doubleteeing.
-				elmBytes := info.EDec(tee)
-				var keyBytes []byte
-				if info.KeyDec != nil {
-					kbuf := bytes.NewBuffer(elmBytes)
-					keyBytes = info.KeyDec(kbuf) // TODO: Optimize unnecessary copies. This is tripleteeing?
-				}
-				for _, w := range ws {
-					newPending = append(newPending,
-						element{
-							window:    w,
-							timestamp: et,
-							pane:      stage.kind.getPaneOrDefault(stage, pn, w, keyBytes, rb.BundleID),
-							elmBytes:  elmBytes,
-							keyBytes:  keyBytes,
-							sequence:  seq,
-						})
-					seq++
-				}
+			if len(ws) == 0 {
+				slog.Warn("PersistBundle: sdk provided a windowed value header 0 windows", "bundle", rb)
+			}
+			// TODO: Optimize unnecessary copies. This is doubleteeing.
+			elmBytes := info.EDec(tee)
+			var keyBytes []byte
+			if info.KeyDec != nil {
+				kbuf := bytes.NewBuffer(elmBytes)
+				keyBytes = info.KeyDec(kbuf) // TODO: Optimize unnecessary copies. This is tripleteeing?
+			}
+			for _, w := range ws {
+				newPending = append(newPending,
+					element{
+						window:    w,
+						timestamp: et,
+						pane:      stage.kind.getPaneOrDefault(stage, pn, w, keyBytes, rb.BundleID),
+						elmBytes:  elmBytes,
+						keyBytes:  keyBytes,
+						sequence:  seq,
+					})
+				seq++
 			}
 		}
 		consumers := em.consumers[output]

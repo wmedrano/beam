@@ -315,7 +315,7 @@ func dockerEnvironment(ctx context.Context, logger *slog.Logger, dp *pipepb.Dock
 func processEnvironment(ctx context.Context, logger *slog.Logger, pp *pipepb.ProcessPayload, wk *worker.W) {
 	defer wk.Stop()
 
-	cmd := exec.CommandContext(ctx, pp.GetCommand(), "--id='"+wk.ID+"'", "--provision_endpoint="+wk.Endpoint())
+	cmd := processCommand(ctx, pp.GetCommand(), wk.ID, wk.Endpoint())
 	logger.Debug("starting process", "cmd", cmd.String())
 
 	cmd.WaitDelay = time.Millisecond * 100
@@ -335,4 +335,10 @@ func processEnvironment(ctx context.Context, logger *slog.Logger, pp *pipepb.Pro
 	if err := cmd.Wait(); err != nil {
 		logger.Error("process failed while running", "error", err)
 	}
+}
+
+// processCommand passes worker metadata directly to exec. Shell quoting would
+// become part of the argument and change the worker ID seen by provisioning.
+func processCommand(ctx context.Context, command, workerID, provisionEndpoint string) *exec.Cmd {
+	return exec.CommandContext(ctx, command, "--id="+workerID, "--provision_endpoint="+provisionEndpoint)
 }
