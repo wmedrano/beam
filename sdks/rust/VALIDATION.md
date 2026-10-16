@@ -18,9 +18,11 @@ limitations under the License.
 # Prism slice validation, 2026-10-15
 
 The agreed scope of this change is a tested native **Prism PROCESS vertical
-slice**. Docker distribution, Flink, and cross-language I/O are follow-up work.
-This record does not mark the original M0–M2 milestones complete; the remaining
-gates are listed in [features.toml](features.toml).
+slice**, including native local text I/O. Docker distribution and Flink are
+optional follow-ups; Java expansion and cross-language I/O are outside scope.
+The prototype acceptance in [TASK.md](../../TASK.md) is complete locally. The
+broader M1/M2 release roadmap remains unfinished; [features.toml](features.toml)
+distinguishes those follow-ups from prototype acceptance.
 
 Tests used Linux x86_64, Rust 1.96.1, Go 1.26.2, Python 3.14.8 with
 protobuf 7.36.1, and protoc 34.0. Gradle checks used Java 21.0.12.1+1.
@@ -54,21 +56,29 @@ All commands passed. The regeneration tools were installed using
 | Check | Observed result |
 | --- | --- |
 | Formatting and Clippy | Passed, including all-target/all-feature Clippy with warnings denied. |
-| Ordinary Rust tests | 15 passed, plus two compile-fail doctests. Three integration tests are explicitly ignored by this command and run by the scripts below. |
+| Ordinary Rust tests | 23 passed, plus two compile-fail doctests. Three integration tests are explicitly ignored by this command and run by the scripts below. |
 | Standard coders | 111 shared reference cases checked for decoding and canonical encoding, with nested/outer contexts. The exact unsupported coder set is checked. Additional tests cover malformed inputs, bounded decoder smoke fuzzing, frame fragmentation, metadata, and nested nullable presence. |
 | Go protocol interoperability | Two integration tests passed against the independent grpc-go Beam API peer and checkout Prism Job service. Includes unary/server/bidirectional streaming, metadata, status, server-observed deadline cancellation, backpressure while an unrelated RPC progresses, and mTLS with negative hostname/trust/client-identity cases. |
-| Prism PROCESS | One integration test passed all 15 scenarios below, using real native worker processes and runner shuffles. |
-| Packaged crates | All three exact Cargo tarballs were extracted outside Beam, tested offline with local patches for unpublished sibling crates, and consumed by a separately built and executed application. `PROTOC` was unavailable during this check. |
+| Prism PROCESS | One integration test passed all 23 scenarios below, using real native worker processes and runner shuffles. |
+| Packaged crates | All three exact Cargo tarballs were extracted outside Beam, rebuilt and tested offline with local patches for unpublished sibling crates, and consumed by a separately built and executed application. `PROTOC` was unavailable during this check. Normalized archive timestamps cannot reuse stale Beam artifacts; the script clears those artifacts while retaining third-party caches. |
 | Dependency inventory | All-feature metadata for 217 external dependencies matches `DEPENDENCIES.csv`; none lack a license field. This is metadata inventory, not an ASF release approval. |
 | Regeneration | All 22 generated files match the authoritative inputs, including the required 18 qualified `Default` calls. Shared coder test data also matches the model source. |
 
-The 15 runner scenarios are WordCount; fan-out/Flatten with three 2 MiB byte
+The 23 runner scenarios are WordCount; fan-out/Flatten with three 2 MiB byte
 elements; CPU-heavy processing; a user error; a process-hook panic; a worker
 identity mismatch; an incorrect content assertion; an assertion on empty input;
 an incorrect multiplicity assertion; invalid UTF-8 configuration; a factory
-panic; a setup error; a setup panic; a finish error; and cancellation. The
-acceptance app also checks empty collections, repeated values, wrapping sums,
+panic; a setup error; a setup panic; a finish error; cancellation; an 80 MiB
+shuffled group; partial group consumption; chained finish-only emissions; native
+UTF-8/CRLF text round trip; an empty file; a missing file; invalid UTF-8; and an
+invalid output path. The acceptance app also checks empty collections,
+repeated values, wrapping sums,
 and distributed assertions. Successful jobs report committed user counters.
+Group tests also check independent concurrent iterators, malformed tails,
+partial consumption across block/group boundaries, and release of disk budgets.
+Harness tests check interleaved inputs while another bundle waits, blocked output
+and end-marker acknowledgement, disconnect wakeups, registration limits and
+atomicity, finish dependency ordering, and log timestamps/transform context.
 The cancellation case observes terminal `CANCELLED` after the driver's request.
 Expected failure cases check their diagnostics and that Prism remains alive.
 
@@ -115,9 +125,16 @@ implementation evidence, and the tested Tonic adapter for the same official
 protobuf messages.
 
 No comparative throughput, memory, or startup benchmark has been established.
-The CPU and large-element scenarios are correctness checks. Java protocol
-interop, sustained adversarial/concurrent harness stress, lazy fallible grouped
-iteration and hot-key spooling, Register acceptance, authenticated SDK
-deployment, and worker retry acceptance remain unverified. Docker, Flink,
-artifacts, Rows, expansion, foreign I/O, and advanced streaming features have
-no enabled support in this slice.
+The CPU and large-element scenarios are correctness checks. Long-running
+whole-worker stress, real-runner Register acceptance, hosted CI, and distributed
+retry acceptance remain future evidence. Targeted concurrent harness tests pass;
+that does not establish sustained distributed operation. The local text sink
+provides atomic publication per bundle, with possible duplicate shards on retry.
+
+Prism sends the tested 80 MiB group in one Fn Data message. Fn Data accepts at
+most 128 MiB per message; scalar/items and outputs remain capped at 64 MiB.
+Group spools share a separate 1 GiB live-file budget, in addition to the 1 GiB
+raw input-spool budget. General custom coder URNs, arbitrary pipeline options,
+and richer connectors are future native work. Docker, Flink, authenticated
+submission, and artifacts have no enabled support. Java expansion, foreign
+I/O, portable Rows, and advanced streaming remain outside prototype scope.

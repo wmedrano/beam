@@ -68,9 +68,11 @@ the job service of Prism built from this checkout. Prism PROCESS acceptance
 then exercises real provisioning, Fn control/data/logging, descriptor lookup,
 metrics metadata lookup and job lifecycle with native workers.
 
-This establishes the local experimental path and transport adapter. Java
-interop, authenticated SDK deployment, Docker/Flink, foreign environments and
-distributed recovery remain separate gates.
+This establishes the local experimental path and transport adapter. A separate
+Java interoperability gate is unnecessary for the native Prism prototype.
+Authenticated deployment, Docker/Flink, and distributed recovery require their
+own acceptance if selected later. Java expansion and foreign I/O are outside
+prototype scope.
 
 ## Protobuf generator workaround
 

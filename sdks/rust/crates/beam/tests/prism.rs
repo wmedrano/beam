@@ -74,6 +74,9 @@ fn bounded_process_acceptance() {
     for (case, success, diagnostic) in [
         ("", true, "pipeline completed"),
         ("large", true, "pipeline completed"),
+        ("hot_group", true, "pipeline completed"),
+        ("partial_group", true, "pipeline completed"),
+        ("finish_emit", true, "pipeline completed"),
         ("slow", true, "pipeline completed"),
         ("fail", false, "requested user failure"),
         ("panic", false, "processor discarded"),
@@ -141,6 +144,90 @@ fn bounded_process_acceptance() {
         eprintln!(
             "Prism PROCESS case {case:?}: expected success={success}, elapsed={:?}",
             start.elapsed()
+        );
+    }
+    let text_io = std::env::var("BEAM_RUST_TEXT_IO").expect("set BEAM_RUST_TEXT_IO");
+    for case in [
+        "roundtrip",
+        "empty_file",
+        "missing",
+        "invalid_utf8",
+        "bad_output",
+    ] {
+        let success = case == "roundtrip" || case == "empty_file";
+        let input = directory.path().join(format!("text-{case}.txt"));
+        let output = directory.path().join(format!("text-{case}-output"));
+        if case != "missing" {
+            std::fs::write(
+                &input,
+                if case == "empty_file" {
+                    &b""[..]
+                } else if case == "invalid_utf8" {
+                    &b"bad\xff\n"[..]
+                } else {
+                    "red blue\r\n\ncafé\nlast".as_bytes()
+                },
+            )
+            .unwrap();
+        }
+        if case == "bad_output" {
+            std::fs::write(&output, b"a file, not a directory").unwrap();
+        }
+        let log = File::create(directory.path().join(format!("text-{case}.log"))).unwrap();
+        let mut driver = Process(
+            Command::new(&text_io)
+                .args([
+                    format!("--endpoint={address}"),
+                    format!("--input={}", input.display()),
+                    format!("--output={}", output.display()),
+                    "--job_name=rust-native-text".to_owned(),
+                ])
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait(&mut driver.0, Duration::from_secs(30));
+        let log =
+            std::fs::read_to_string(directory.path().join(format!("text-{case}.log"))).unwrap();
+        assert_eq!(status.success(), success, "text case={case}: {log}");
+        if success {
+            let mut actual = Vec::new();
+            let mut shard_count = 0;
+            for shard in std::fs::read_dir(&output).unwrap() {
+                shard_count += 1;
+                let shard = shard.unwrap();
+                assert!(shard.file_name().to_str().unwrap().starts_with("part-"));
+                actual.extend(
+                    std::fs::read_to_string(shard.path())
+                        .unwrap()
+                        .lines()
+                        .map(str::to_owned),
+                );
+            }
+            actual.sort();
+            assert!(shard_count > 0);
+            assert_eq!(
+                actual,
+                if case == "empty_file" {
+                    vec![]
+                } else {
+                    vec!["", "café", "last", "red blue"]
+                }
+            );
+        } else {
+            assert!(
+                log.contains("Enum::Failed"),
+                "expected worker failure: {log}"
+            );
+        }
+        assert!(
+            runner.0.try_wait().unwrap().is_none(),
+            "Prism crashed in text case {case}"
+        );
+        eprintln!(
+            "Prism PROCESS text I/O case {case}: expected success={}",
+            success
         );
     }
     let log = File::create(directory.path().join("cancel.log")).unwrap();

@@ -17,12 +17,12 @@ use crate::graph::{ASSERT_CHECK, ASSERT_TAG, CREATE, DOFN, SUM};
 use crate::metrics::{Catalog, Metrics};
 use crate::registry::{Processor, Registry};
 use crate::{Result, error};
-use beam_coders::{Coder, Context, Error as DecodeError, Limits, Value, WindowedValue};
+use beam_coders::{Coder, Context, Limits, SpoolBudget, Value, WindowedValue};
 use beam_model as model;
 use protobuf::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
@@ -37,12 +37,25 @@ struct Spool {
     bytes: u64,
     closed: bool,
 }
-#[derive(Default)]
 struct Hub {
     inputs: Mutex<HashMap<Port, Spool>>,
     failure: Mutex<Option<String>>,
     notify: Notify,
     senders: tokio::sync::Mutex<HashMap<String, DataSender>>,
+    groups: SpoolBudget,
+    logging: Option<mpsc::Sender<model::log_entry::List>>,
+}
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            inputs: Mutex::default(),
+            failure: Mutex::default(),
+            notify: Notify::new(),
+            senders: tokio::sync::Mutex::default(),
+            groups: SpoolBudget::new(1024 * 1024 * 1024),
+            logging: None,
+        }
+    }
 }
 
 fn request<T>(value: T, worker: &str) -> Result<Request<T>> {
@@ -66,7 +79,7 @@ impl Hub {
         }
         let mut client =
             model::beam_fn_data_client::BeamFnDataClient::new(crate::job::connect(url).await?)
-                .with_max_message_bytes(64 * 1024 * 1024);
+                .with_max_message_bytes(128 * 1024 * 1024);
         let (tx, rx) = mpsc::channel::<Packet>(8);
         let stream = ReceiverStream::new(rx).map(|(message, ack)| {
             if let Some(ack) = ack {
@@ -79,46 +92,7 @@ impl Hub {
         tokio::spawn(async move {
             let result: Result<()> = async {
                 while let Some(message) = responses.message().await? {
-                    if !message.timers().is_empty() {
-                        return Err(error("Rust timer data is unsupported"));
-                    }
-                    let mut inputs = hub.inputs.lock().unwrap();
-                    for data in message.data().iter() {
-                        if inputs.values().map(|spool| spool.bytes).sum::<u64>()
-                            + data.data().len() as u64
-                            > 1024 * 1024 * 1024
-                        {
-                            return Err(error("worker input spools exceed the 1 GiB disk budget"));
-                        }
-                        let key = (
-                            data.instruction_id().to_string(),
-                            data.transform_id().to_string(),
-                        );
-                        if inputs.len() >= 128 && !inputs.contains_key(&key) {
-                            return Err(error("too many input streams"));
-                        }
-                        let spool = match inputs.entry(key) {
-                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(Spool {
-                                    file: NamedTempFile::new()?,
-                                    bytes: 0,
-                                    closed: false,
-                                })
-                            }
-                        };
-                        if spool.closed {
-                            return Err(error("data after stream end marker"));
-                        }
-                        spool.bytes += data.data().len() as u64;
-                        if spool.bytes > 1024 * 1024 * 1024 {
-                            return Err(error("bundle input spool exceeds 1 GiB limit"));
-                        }
-                        spool.file.write_all(data.data())?;
-                        spool.closed = data.is_last();
-                    }
-                    drop(inputs);
-                    hub.notify.notify_waiters();
+                    hub.receive(message)?;
                 }
                 Err(error("Fn Data stream disconnected"))
             }
@@ -130,6 +104,47 @@ impl Hub {
         });
         senders.insert(url.to_owned(), tx.clone());
         Ok(tx)
+    }
+
+    fn receive(&self, message: model::Elements) -> Result<()> {
+        if !message.timers().is_empty() {
+            return Err(error("Rust timer data is unsupported"));
+        }
+        let mut inputs = self.inputs.lock().unwrap();
+        for data in message.data().iter() {
+            if inputs.values().map(|spool| spool.bytes).sum::<u64>() + data.data().len() as u64
+                > 1024 * 1024 * 1024
+            {
+                return Err(error("worker input spools exceed the 1 GiB disk budget"));
+            }
+            let key = (
+                data.instruction_id().to_string(),
+                data.transform_id().to_string(),
+            );
+            if inputs.len() >= 128 && !inputs.contains_key(&key) {
+                return Err(error("too many input streams"));
+            }
+            let spool = match inputs.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Spool {
+                    file: NamedTempFile::new()?,
+                    bytes: 0,
+                    closed: false,
+                }),
+            };
+            if spool.closed {
+                return Err(error("data after stream end marker"));
+            }
+            spool.bytes += data.data().len() as u64;
+            if spool.bytes > 1024 * 1024 * 1024 {
+                return Err(error("bundle input spool exceeds 1 GiB limit"));
+            }
+            spool.file.write_all(data.data())?;
+            spool.closed = data.is_last();
+        }
+        drop(inputs);
+        self.notify.notify_waiters();
+        Ok(())
     }
 
     async fn input(&self, bundle: &str, port: &str) -> Result<File> {
@@ -230,6 +245,36 @@ fn validate_descriptor(descriptor: &model::ProcessBundleDescriptor) -> Result<()
     Ok(())
 }
 
+fn register_descriptors(
+    cache: &mut HashMap<String, model::ProcessBundleDescriptor>,
+    request: model::RegisterRequestView<'_>,
+) -> Result<()> {
+    if request.process_bundle_descriptor().len() > 128 {
+        return Err(error("bundle descriptor cache limit exceeded"));
+    }
+    let mut additions = HashMap::new();
+    for descriptor in request.process_bundle_descriptor().iter() {
+        let descriptor = descriptor.to_owned();
+        let id = descriptor.id().to_str()?.to_owned();
+        if id.is_empty() || additions.contains_key(&id) {
+            return Err(error("empty or duplicate registered descriptor ID"));
+        }
+        validate_descriptor(&descriptor)?;
+        additions.insert(id, descriptor);
+    }
+    if cache.len()
+        + additions
+            .keys()
+            .filter(|id| !cache.contains_key(*id))
+            .count()
+        > 128
+    {
+        return Err(error("bundle descriptor cache limit exceeded"));
+    }
+    cache.extend(additions);
+    Ok(())
+}
+
 fn port_value(coder: &Coder) -> Result<&Coder> {
     match coder {
         Coder::Windowed(value, window) if **window == Coder::GlobalWindow => Ok(value),
@@ -262,7 +307,6 @@ pub(crate) async fn run(registry: Arc<Registry>, args: BTreeMap<String, String>)
         .control(request(ReceiverStream::new(rx), &worker)?)
         .await?
         .into_inner();
-    let hub = Arc::new(Hub::default());
     let cache = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
         model::ProcessBundleDescriptor,
@@ -276,7 +320,11 @@ pub(crate) async fn run(registry: Arc<Registry>, args: BTreeMap<String, String>)
     let mut tasks = tokio::task::JoinSet::new();
     // Opening logging is part of boot. Its bounded channel stays alive until
     // control ends; stderr remains a useful fallback on transport failure.
-    let _logging = logging(endpoint(info.info().logging_endpoint())?, &worker).await?;
+    let logging = logging(endpoint(info.info().logging_endpoint())?, &worker).await?;
+    let hub = Arc::new(Hub {
+        logging: Some(logging),
+        ..Hub::default()
+    });
     eprintln!("Rust worker {worker} connected");
     while let Some(instruction) = instructions.message().await? {
         while let Some(completed) = tasks.try_join_next() {
@@ -325,6 +373,9 @@ pub(crate) async fn run(registry: Arc<Registry>, args: BTreeMap<String, String>)
                             .get_process_bundle_descriptor(request(req, &worker)?)
                             .await?
                             .into_inner();
+                        if descriptor.id() != id.as_str() {
+                            return Err(error("returned bundle descriptor ID mismatch"));
+                        }
                         let mut descriptors = cache.lock().await;
                         if descriptors.len() >= 128 && !descriptors.contains_key(&id) {
                             return Err(error("bundle descriptor cache limit exceeded"));
@@ -383,13 +434,13 @@ pub(crate) async fn run(registry: Arc<Registry>, args: BTreeMap<String, String>)
             let mut response = model::InstructionResponse::new();
             response.set_instruction_id(&instruction_id);
             if instruction.has_register() {
-                for descriptor in instruction.register().process_bundle_descriptor().iter() {
-                    cache
-                        .lock()
-                        .await
-                        .insert(descriptor.id().to_string(), descriptor.to_owned());
+                let mut descriptors = cache.lock().await;
+                match register_descriptors(&mut descriptors, instruction.register()) {
+                    Ok(()) => {
+                        response.register_mut();
+                    }
+                    Err(error) => response.set_error(error.to_string()),
                 }
-                response.register_mut();
             } else if instruction.has_process_bundle_progress() {
                 response.process_bundle_progress_mut();
                 if let Some(metrics) = active.lock().unwrap().get(
@@ -437,7 +488,6 @@ pub(crate) async fn run(registry: Arc<Registry>, args: BTreeMap<String, String>)
                 .await
                 .map_err(|_| error("control response stream disconnected"))?;
         }
-        while tasks.try_join_next().is_some() {}
     }
     tasks.abort_all();
     Err(error(
@@ -562,6 +612,7 @@ struct Stage {
     consumers: HashMap<String, Vec<String>>,
     operators: BTreeMap<String, Operator>,
     metrics: Arc<Metrics>,
+    logging: Option<mpsc::Sender<model::log_entry::List>>,
 }
 impl Stage {
     fn route(&mut self, collection: &str, value: &WindowedValue, depth: usize) -> Result<()> {
@@ -569,6 +620,8 @@ impl Stage {
             return Err(error("cyclic or too deeply fused stage"));
         }
         let metrics = self.metrics.clone();
+        let logging = self.logging.clone();
+        let bundle = self.bundle.clone();
         metrics.element(collection);
         let consumers = self.consumers.get(collection).cloned().unwrap_or_default();
         for id in consumers {
@@ -596,6 +649,7 @@ impl Stage {
                             )
                         },
                         &mut |name, delta| metrics.counter(&id, name, delta),
+                        &mut |message| user_log(&logging, &bundle, &id, message),
                     ),
                 Operator::Builtin {
                     out,
@@ -633,6 +687,93 @@ impl Stage {
         }
         Ok(())
     }
+
+    fn finish(&mut self) -> Result<()> {
+        // Finish upstream functions first: their outputs must still pass
+        // through live downstream processors, even with lexically sorted IDs.
+        let mut pending: std::collections::BTreeSet<_> = self.operators.keys().cloned().collect();
+        while !pending.is_empty() {
+            let ready: Vec<_> = pending
+                .iter()
+                .filter(|id| {
+                    !pending.iter().any(|parent| {
+                        let out = match &self.operators[parent] {
+                            Operator::User { out, .. }
+                            | Operator::Builtin { out, .. }
+                            | Operator::Flatten { out } => Some(out),
+                            Operator::Sink { .. } => None,
+                        };
+                        out.and_then(|out| self.consumers.get(out))
+                            .is_some_and(|consumers| consumers.contains(id))
+                    })
+                })
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                return Err(error("cycle during bundle finish"));
+            }
+            for id in ready {
+                let mut operator = self.operators.remove(&id).unwrap();
+                if let Operator::User {
+                    processor: Some(processor),
+                    out,
+                    ..
+                } = &mut operator
+                {
+                    let metrics = self.metrics.clone();
+                    let logging = self.logging.clone();
+                    let bundle = self.bundle.clone();
+                    processor.finish(
+                        &mut |value, timestamp| {
+                            self.route(
+                                out,
+                                &WindowedValue {
+                                    value,
+                                    timestamp,
+                                    windows: vec![Value::GlobalWindow],
+                                    pane: beam_coders::Pane::default(),
+                                },
+                                256,
+                            )
+                        },
+                        &mut |name, delta| metrics.counter(&id, name, delta),
+                        &mut |message| user_log(&logging, &bundle, &id, message),
+                    )?;
+                }
+                self.operators.insert(id.clone(), operator);
+                pending.remove(&id);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn user_log(
+    sender: &Option<mpsc::Sender<model::log_entry::List>>,
+    bundle: &str,
+    transform: &str,
+    message: &str,
+) -> Result<()> {
+    if message.len() > 16 * 1024 {
+        return Err(error("user log message exceeds 16 KiB"));
+    }
+    let mut entry = model::LogEntry::new();
+    entry.set_severity(model::log_entry::severity::Enum::Info);
+    entry.set_instruction_id(bundle);
+    entry.set_transform_id(transform);
+    entry.set_message(message);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    entry.timestamp_mut().set_seconds(now.as_secs() as i64);
+    entry.timestamp_mut().set_nanos(now.subsec_nanos() as i32);
+    let mut list = model::log_entry::List::new();
+    list.log_entries_mut().push(entry);
+    if sender
+        .as_ref()
+        .is_none_or(|sender| sender.try_send(list).is_err())
+    {
+        eprintln!("bundle={bundle} transform={transform}: {message}");
+    }
+    Ok(())
 }
 
 fn send_data(
@@ -689,13 +830,11 @@ fn builtin(
             let Value::Kv(key, values) = input else {
                 return Err(error("SumI64 requires KV input"));
             };
-            let Value::Iterable(values) = values.as_ref() else {
-                return Err(error("SumI64 requires grouped values"));
-            };
             let mut sum = 0_i64;
-            for value in values {
+            for value in values.iterable()? {
+                let value = value?;
                 if let Value::I64(v) = value {
-                    sum = sum.wrapping_add(*v);
+                    sum = sum.wrapping_add(v);
                 } else {
                     return Err(error("SumI64 requires i64 values"));
                 }
@@ -716,30 +855,40 @@ fn builtin(
             let Value::Kv(_, values) = input else {
                 return Err(error("assertion requires KV"));
             };
-            let Value::Iterable(values) = values.as_ref() else {
-                return Err(error("assertion requires grouping"));
+            let Value::Iterable(expected) = Coder::Iterable(Box::new(Coder::Bytes)).decode(
+                config,
+                Context::Outer,
+                Limits::default(),
+            )?
+            else {
+                unreachable!()
             };
-            let mut actual = Vec::new();
-            for value in values {
+            let mut remaining = BTreeMap::<Vec<u8>, usize>::new();
+            for value in expected {
+                let Value::Bytes(bytes) = value else {
+                    unreachable!()
+                };
+                *remaining.entry(bytes).or_default() += 1;
+            }
+            for value in values.iterable()? {
+                let value = value?;
                 let Value::Kv(tag, bytes) = value else {
                     return Err(error("invalid assertion tag"));
                 };
                 if tag.as_ref() == &Value::Bool(true) {
-                    actual.push(bytes.as_ref().clone());
+                    let Value::Bytes(bytes) = *bytes else {
+                        return Err(error("invalid assertion bytes"));
+                    };
+                    let count = remaining.get_mut(&bytes).ok_or_else(|| {
+                        error("distributed content/multiplicity assertion failed")
+                    })?;
+                    if *count == 0 {
+                        return Err(error("distributed content/multiplicity assertion failed"));
+                    }
+                    *count -= 1;
                 }
             }
-            actual.sort_by(|a, b| {
-                let (Value::Bytes(a), Value::Bytes(b)) = (a, b) else {
-                    return std::cmp::Ordering::Equal;
-                };
-                a.cmp(b)
-            });
-            let expected = Coder::Iterable(Box::new(Coder::Bytes)).decode(
-                config,
-                Context::Outer,
-                Limits::default(),
-            )?;
-            if Value::Iterable(actual) != expected {
+            if remaining.values().any(|count| *count != 0) {
                 return Err(error("distributed content/multiplicity assertion failed"));
             }
         }
@@ -763,6 +912,7 @@ async fn bundle(
         consumers: HashMap::new(),
         operators: BTreeMap::new(),
         metrics,
+        logging: hub.logging.clone(),
     };
     let mut sources = Vec::new();
     let transforms: Vec<_> = descriptor
@@ -875,6 +1025,7 @@ async fn bundle(
         readers.push((hub.input(bundle, &port).await?, collection, coder));
     }
     let permit = compute.acquire_owned().await?;
+    let group_budget = hub.groups.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let _permit = permit;
         for operator in stage.operators.values_mut() {
@@ -891,52 +1042,22 @@ async fn bundle(
                 *processor = Some(instance);
             }
         }
-        for (mut file, collection, coder) in readers {
-            let mut buffer = Vec::new();
-            let mut chunk = [0; 64 * 1024];
-            let mut eof = false;
-            loop {
-                if buffer.is_empty() && eof {
-                    break;
-                }
-                match coder.decode_prefix(&buffer, Context::Nested, Limits::default()) {
-                    Ok((Value::Windowed(value), consumed)) if consumed > 0 => {
-                        stage.route(&collection, &value, 256)?;
-                        buffer.drain(..consumed);
-                    }
-                    Err(DecodeError::NeedMore) if !eof => {
-                        // Completed input streams are already on disk. Grow
-                        // geometrically so a large grouped value is not
-                        // decoded and reallocated once per 64 KiB fragment.
-                        let target = buffer
-                            .len()
-                            .max(chunk.len())
-                            .saturating_mul(2)
-                            .min(Limits::default().bytes + 1);
-                        while buffer.len() < target {
-                            let wanted = (target - buffer.len()).min(chunk.len());
-                            let count = file.read(&mut chunk[..wanted])?;
-                            if count == 0 {
-                                eof = true;
-                                break;
-                            }
-                            buffer.extend_from_slice(&chunk[..count]);
-                        }
-                    }
-                    Err(error) => return Err(error.into()),
-                    _ => return Err(error("runner data must contain complete windowed values")),
-                }
+        for (file, collection, coder) in readers {
+            let mut file = BufReader::new(file);
+            while !file.fill_buf()?.is_empty() {
+                let Value::Windowed(value) = coder.read_spooled(
+                    &mut file,
+                    &mut tempfile::tempfile,
+                    group_budget.clone(),
+                    Limits::default(),
+                )?
+                else {
+                    return Err(error("runner data must contain complete windowed values"));
+                };
+                stage.route(&collection, &value, 256)?;
             }
         }
-        for operator in stage.operators.values_mut() {
-            if let Operator::User {
-                processor: Some(processor),
-                ..
-            } = operator
-            {
-                processor.finish()?;
-            }
-        }
+        stage.finish()?;
         for (id, operator) in &stage.operators {
             if let Operator::Sink { sender, .. } = operator {
                 send_data(sender, &stage.bundle, id, vec![], true)?;
@@ -990,6 +1111,7 @@ mod tests {
         let mut stage = Stage {
             bundle: "bundle-7".to_owned(),
             metrics: metrics.clone(),
+            logging: None,
             consumers: HashMap::from([
                 (
                     "input".to_owned(),
@@ -1086,5 +1208,223 @@ mod tests {
         wrong.spec_mut().set_urn("beam:coder:kv:v1");
         descriptor.coders_mut().insert("wrong", wrong);
         assert!(coder(&descriptor, "wrong", 64).is_err());
+    }
+
+    struct FinishOnly(i64);
+    impl DoFn for FinishOnly {
+        type Input = i64;
+        type Output = i64;
+        type Config = ();
+        fn from_config(_: ()) -> Result<Self> {
+            Ok(Self(0))
+        }
+        fn process(&mut self, value: &i64, _: &mut ProcessContext<'_, i64>) -> Result<()> {
+            self.0 += value;
+            Ok(())
+        }
+        fn finish_bundle(&mut self, context: &mut crate::FinishContext<'_, i64>) -> Result<()> {
+            context.log("finished")?;
+            context.counter("finished", 1)?;
+            context.emit(self.0, 4321)
+        }
+    }
+
+    #[test]
+    fn finish_outputs_follow_dependencies_and_include_log_context() {
+        let app = Application::new("test")
+            .register_dofn::<FinishOnly>("test:finish:v1")
+            .unwrap();
+        let payload =
+            app.registry
+                .payload("test:finish:v1", "beam:rust:config:empty:v1", 1, vec![]);
+        let user = |out: &str| {
+            let mut processor = app
+                .registry
+                .processor(&payload, &Coder::VarInt, &Coder::VarInt)
+                .unwrap();
+            processor.start().unwrap();
+            Operator::User {
+                out: out.to_owned(),
+                processor: Some(processor),
+                payload: payload.clone(),
+                input: Coder::VarInt,
+                output: Coder::VarInt,
+            }
+        };
+        let wire = Coder::Windowed(Box::new(Coder::VarInt), Box::new(Coder::GlobalWindow));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (logs, mut log_receiver) = mpsc::channel(4);
+        let mut stage = Stage {
+            bundle: "finish-bundle".to_owned(),
+            metrics: Arc::new(Metrics::default()),
+            logging: Some(logs),
+            consumers: HashMap::from([
+                ("input".to_owned(), vec!["z-upstream".to_owned()]),
+                ("middle".to_owned(), vec!["a-downstream".to_owned()]),
+                ("output".to_owned(), vec!["sink".to_owned()]),
+            ]),
+            operators: BTreeMap::from([
+                ("z-upstream".to_owned(), user("middle")),
+                ("a-downstream".to_owned(), user("output")),
+                (
+                    "sink".to_owned(),
+                    Operator::Sink {
+                        coder: wire.clone(),
+                        sender,
+                    },
+                ),
+            ]),
+        };
+        for value in [10, 20, 3] {
+            stage
+                .route(
+                    "input",
+                    &WindowedValue {
+                        value: Value::I64(value),
+                        timestamp: -1,
+                        windows: vec![Value::GlobalWindow],
+                        pane: beam_coders::Pane::default(),
+                    },
+                    64,
+                )
+                .unwrap();
+        }
+        assert!(receiver.try_recv().is_err());
+        stage.finish().unwrap();
+        let (message, _) = receiver.blocking_recv().unwrap();
+        let Value::Windowed(output) = wire
+            .decode(
+                message.data().get(0).unwrap().data(),
+                Context::Nested,
+                Limits::default(),
+            )
+            .unwrap()
+        else {
+            panic!("windowed output");
+        };
+        assert_eq!(output.value, Value::I64(33));
+        assert_eq!(output.timestamp, 4321);
+        for transform in ["z-upstream", "a-downstream"] {
+            let list = log_receiver.blocking_recv().unwrap();
+            let entry = list.log_entries().get(0).unwrap();
+            assert_eq!(entry.instruction_id(), "finish-bundle");
+            assert_eq!(entry.transform_id(), transform);
+            assert_eq!(entry.message(), "finished");
+            assert!(entry.timestamp().seconds() > 0);
+        }
+    }
+
+    fn frame(bundle: &str, data: &[u8], last: bool) -> model::Elements {
+        let mut entry = model::elements::Data::new();
+        entry.set_instruction_id(bundle);
+        entry.set_transform_id("source");
+        entry.set_data(data);
+        entry.set_is_last(last);
+        let mut message = model::Elements::new();
+        message.data_mut().push(entry);
+        message
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_input_does_not_block_interleaved_bundle_and_disconnect_wakes_waiters() {
+        let hub = Arc::new(Hub::default());
+        hub.receive(frame("blocked", b"prefix", false)).unwrap();
+        let other = hub.clone();
+        let pending = tokio::spawn(async move { other.input("blocked", "source").await });
+        for _ in 0..100 {
+            hub.receive(frame("ready", b"x", false)).unwrap();
+            hub.receive(frame("blocked", b"y", false)).unwrap();
+        }
+        hub.receive(frame("ready", b"", true)).unwrap();
+        let mut file = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            hub.input("ready", "source"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+        assert_eq!(bytes, vec![b'x'; 100]);
+        assert!(!pending.is_finished());
+        hub.release("ready");
+        *hub.failure.lock().unwrap() = Some("disconnected".to_owned());
+        hub.notify.notify_waiters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        hub.release("blocked");
+        assert!(hub.inputs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_output_waits_for_end_marker_and_reports_closed_transport() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let output = tokio::task::spawn_blocking(move || {
+            send_data(&sender, "bundle", "sink", vec![42], false)?;
+            send_data(&sender, "bundle", "sink", vec![], true)
+        });
+        let (first, _) = receiver.recv().await.unwrap();
+        assert!(!first.data().get(0).unwrap().is_last());
+        let (last, ack) = receiver.recv().await.unwrap();
+        assert!(last.data().get(0).unwrap().is_last());
+        assert!(!output.is_finished());
+        // Unrelated executor work progresses while the compute task waits.
+        assert_eq!(tokio::spawn(async { 17 }).await.unwrap(), 17);
+        ack.unwrap().send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), output)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(
+            tokio::task::spawn_blocking(move || send_data(&sender, "bundle", "sink", vec![], true))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn descriptor_registration_is_bounded_and_atomic() {
+        let mut cache = HashMap::new();
+        let mut request = model::RegisterRequest::new();
+        for index in 0..128 {
+            let mut descriptor = model::ProcessBundleDescriptor::new();
+            descriptor.set_id(format!("descriptor-{index}"));
+            request.process_bundle_descriptor_mut().push(descriptor);
+        }
+        register_descriptors(&mut cache, request.as_view()).unwrap();
+        assert_eq!(cache.len(), 128);
+        let mut extra = model::RegisterRequest::new();
+        let mut descriptor = model::ProcessBundleDescriptor::new();
+        descriptor.set_id("overflow");
+        extra.process_bundle_descriptor_mut().push(descriptor);
+        assert!(register_descriptors(&mut cache, extra.as_view()).is_err());
+        assert_eq!(cache.len(), 128);
+        register_descriptors(&mut cache, request.as_view()).unwrap();
+        let mut replacement = model::RegisterRequest::new();
+        replacement
+            .process_bundle_descriptor_mut()
+            .push(cache["descriptor-0"].clone());
+        replacement
+            .process_bundle_descriptor_mut()
+            .push(model::ProcessBundleDescriptor::new());
+        assert!(register_descriptors(&mut cache, replacement.as_view()).is_err());
+        assert_eq!(cache.len(), 128);
+        let hub = Hub::default();
+        hub.receive(frame("closed", b"", true)).unwrap();
+        assert!(hub.receive(frame("closed", b"late", false)).is_err());
+        hub.release("closed");
+        for index in 0..128 {
+            hub.receive(frame(&index.to_string(), b"", true)).unwrap();
+        }
+        assert!(hub.receive(frame("overflow", b"", true)).is_err());
     }
 }

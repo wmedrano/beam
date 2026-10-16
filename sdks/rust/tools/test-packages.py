@@ -55,6 +55,14 @@ with tempfile.TemporaryDirectory(prefix="beam-rust-packages-") as temporary:
     toolchain = subprocess.check_output(["rustup", "show", "active-toolchain"], cwd=SDK, text=True).split()[0]
     environment = dict(os.environ, CARGO_TARGET_DIR=str(target / "package-validation"), RUSTUP_TOOLCHAIN=toolchain, PROTOC="/unavailable-during-package-verification")
     subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, env=environment, check=True)
+    # Cargo archives normalize source mtimes. A shared target directory can
+    # otherwise reuse an old unpublished crate with the same version/mtime.
+    # Keep third-party build caches, but always rebuild the extracted sources.
+    clean = ["cargo", "clean", "--locked", "--offline"]
+    for package in packages:
+        clean.extend(["-p", package["name"]])
+    clean.extend(["-p", "beam-package-consumer"])
+    subprocess.run(clean, cwd=root, env=environment, check=True)
     subprocess.run(["cargo", "test", "--workspace", "--locked", "--offline"], cwd=root, env=environment, check=True)
     subprocess.run(["cargo", "run", "-p", "beam-package-consumer", "--locked", "--offline"], cwd=root, env=environment, check=True)
 print("Packaged crates and a native consumer passed outside the Beam checkout")

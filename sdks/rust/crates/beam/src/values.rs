@@ -110,11 +110,45 @@ impl<T: BeamValue> BeamValue for Vec<T> {
         Value::Iterable(self.into_iter().map(T::into_value).collect())
     }
     fn from_value(value: &Value) -> Result<Self> {
-        if let Value::Iterable(items) = value {
-            items.iter().map(T::from_value).collect()
-        } else {
-            Err(error("expected iterable"))
+        value
+            .iterable()?
+            .map(|item| T::from_value(&item?))
+            .collect()
+    }
+}
+
+/// Reiterable grouped values. Each item is decoded on demand and can fail.
+/// Partial consumption never affects another group or another iterator.
+pub struct Grouped<T> {
+    value: Value,
+    marker: std::marker::PhantomData<T>,
+}
+impl<T> Clone for Grouped<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+            marker: std::marker::PhantomData,
         }
+    }
+}
+impl<T: BeamValue> Grouped<T> {
+    pub fn iter(&self) -> Result<impl Iterator<Item = Result<T>> + '_> {
+        Ok(self.value.iterable()?.map(|item| T::from_value(&item?)))
+    }
+}
+impl<T: BeamValue> BeamValue for Grouped<T> {
+    fn coder() -> Coder {
+        Coder::Iterable(Box::new(T::coder()))
+    }
+    fn into_value(self) -> Value {
+        self.value
+    }
+    fn from_value(value: &Value) -> Result<Self> {
+        value.iterable()?;
+        Ok(Self {
+            value: value.clone(),
+            marker: std::marker::PhantomData,
+        })
     }
 }
 

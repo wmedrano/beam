@@ -23,4 +23,5 @@ cargo build -p apache-beam --examples --locked
 export BEAM_RUST_PRISM="$sdk_dir/target/tools/prism"
 export BEAM_RUST_ACCEPTANCE="$sdk_dir/target/debug/examples/acceptance"
 export BEAM_RUST_WORDCOUNT="$sdk_dir/target/debug/examples/wordcount"
+export BEAM_RUST_TEXT_IO="$sdk_dir/target/debug/examples/text_io"
 cargo test -p apache-beam --test prism --locked -- --ignored --nocapture

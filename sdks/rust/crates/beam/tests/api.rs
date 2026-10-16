@@ -94,3 +94,20 @@ fn conflicting_or_reserved_registrations_are_rejected() {
         .unwrap();
     assert!(app.register_dofn::<Identity>("test:other:v1").is_err());
 }
+
+#[test]
+fn native_text_io_constructs_without_accessing_worker_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("not-created");
+    let app = Application::new("test");
+    let mut pipeline = app.pipeline().unwrap();
+    let input = pipeline
+        .read_text("Read", vec![missing.to_str().unwrap().to_owned()])
+        .unwrap();
+    pipeline
+        .write_text("Write", &input, missing.to_str().unwrap())
+        .unwrap();
+    assert!(!missing.exists());
+    assert!(pipeline.read_text("Invalid", vec![String::new()]).is_err());
+    assert!(pipeline.write_text("Invalid output", &input, "").is_err());
+}

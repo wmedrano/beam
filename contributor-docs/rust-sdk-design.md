@@ -16,7 +16,8 @@ limitations under the License.
 
 Status: architecture proposal with an initial experimental Prism PROCESS
 implementation. See the [Rust SDK quickstart](../sdks/rust/README.md) and
-[tested feature matrix](../sdks/rust/features.toml). M0–M2 are not complete.
+[tested feature matrix](../sdks/rust/features.toml). The native Prism prototype
+is locally validated; the broader M1/M2 release roadmap is unfinished.
 Repository baseline: `1a3f101544`. Dependency research checked on 2026-10-15.
 API names, crate names, and Rust-specific URNs below are proposed.
 
@@ -31,8 +32,12 @@ dependency proposal below without changing the public Beam model.
 The first native vertical slice runs WordCount, fan-out, Flatten, grouping,
 lowered wrapping sums and distributed multiset assertions on checkout Prism.
 It exposed isolated PROCESS argument and data-fragment persistence fixes in
-Prism. Bounded groups currently use vectors; lazy fallible grouped iteration,
-hot-key spooling, further M0/M1 acceptance and M2 distribution remain pending.
+Prism. Grouped values now use shared disk spools and fallible independent
+iterators, including partial consumption and an 80 MiB Prism acceptance case.
+Finish-bundle outputs run in dependency order and local UTF-8 text I/O executes
+entirely in Rust workers. The selected transport passes the M0 protocol gate.
+Docker/Flink are optional deployment follow-ups; Java expansion and foreign I/O
+are outside the completed prototype scope.
 The executable API is documented in the quickstart; sketches below retain the
 broader proposed design for follow-up work.
 
@@ -59,9 +64,10 @@ Keep RPC types inside the implementation.
 
 Ship user code as an application binary with an explicit registry. Serialize
 function identifiers and configuration, and deploy the executable separately.
-Target bounded batch pipelines first, followed by cross-language I/O and an
-explicitly tested streaming feature set. The first experimental release targets
-Prism and the Flink portable runner. Spark and managed runners need separate
+The prototype targets bounded native pipelines on Prism PROCESS, including
+basic local Rust text I/O. Cross-language I/O and Java expansion are optional
+features, with no requirement to implement them. Docker distribution, the Flink
+portable runner, and an explicitly tested streaming feature set can follow. Spark and managed runners need separate
 validation and, where necessary, submission adapters. Portable execution alone
 does not supply a Dataflow submission client.
 
@@ -477,7 +483,12 @@ local tests and authenticated remote execution are distinct configurations.
 Unsupported authentication fails explicitly. Validate TLS and required runner
 authentication before claiming distributed support.
 
-## Cross-language I/O
+## Optional cross-language I/O
+
+This section preserves the architecture for a possible future feature. Java
+expansion, foreign connector acceptance, and portable Row/schema conversion are
+outside the native prototype scope and are not completion gates.
+
 
 Use Java/Python connectors through expansion before growing a native Rust
 connector catalog. Prefer discoverable SchemaTransforms and supply a lower-level
@@ -509,9 +520,9 @@ to the runner.
 
 | Milestone | Deliverable | Acceptance gate |
 | --- | --- | --- |
-| M0: protocol foundation | Official protobuf generation, RPC clients, provisioning, channels, primitive coders. | Current model compiles, reference vectors pass, and real Go/Java interoperability covers streams, metadata, status, cancellation, TLS configuration, backpressure, and unknown-field retention. Record pins and MSRV. |
+| M0: protocol foundation | Official protobuf generation, RPC clients, provisioning, channels, primitive coders. | Current model compiles, reference vectors pass, and real independent Beam API interoperability (tested with Go) covers streams, metadata, status, cancellation, TLS configuration, backpressure, and unknown-field retention. Record pins and MSRV. |
 | M1: bounded native pipelines | Graph API, registry, Create, ParDo, Flatten, GroupByKey, lowered keyed combine, global windows, metrics; Prism PROCESS. | WordCount crosses a real shuffle. Distributed assertions verify values/multiplicity. Empty input, fan-out, concurrent bundles, partial frames, malformed input, wrong binary/configuration, and failures pass. |
-| M2: experimental distribution | Docker, artifacts, portable submission, Rows, expansion, bounded I/O; Prism and Flink batch. | Application works locally/in Linux containers; connector/Row round trips, package consumption, integrity, cancellation, authentication, and retry/restart tests on a suitable runner pass. Publish limitations. |
+| M2: optional distribution | Docker, artifacts, portable submission, native bounded I/O; Prism and Flink batch. | Application works locally/in Linux containers; native I/O, package consumption, integrity, cancellation, authentication, and retry/restart tests on a suitable runner pass. Foreign connectors and Rows are separate optional features. Publish limitations. |
 | M3: streaming/richer ParDo | Event timestamps, fixed/sliding windows, supported triggers, multiple outputs, iterable/multimap side inputs, state-backed iterables. | TestStream fixtures cover out-of-order events, lateness, panes, boundaries, paged state reads, and stream cancellation on each claimed runner. |
 | M4: advanced features | User state/timers, finalization, SDF, splitting, further windowing; external pool/expansion servers as needed. | Tests cover key/window isolation, timer clearing, retry/finalization, primary/residual accounting, checkpoint/resume, drain, and recovery before capabilities are enabled. |
 
@@ -550,8 +561,8 @@ an explicit mapping to Beam release/model revision/images, rather than implying
 compatibility with every Beam 2.x release. Publish an API change policy before
 stability.
 
-Initially validate SDK, job service, expansion service, and images from one Beam
-release. Add version combinations only when tested. Unknown-field retention does
+Initially validate each selected SDK/service/image integration from one Beam
+release; expansion services are optional. Add version combinations only when tested. Unknown-field retention does
 not establish semantic compatibility with unknown requirements. Dependency
 updates require rebuilding/redeploying an application's compiled worker.
 
@@ -568,8 +579,10 @@ updates require rebuilding/redeploying an application's compiled worker.
 | Wasm | Possible future environment with its own host ABI; not a prerequisite. |
 
 Before M1, settle exact dependency versions/MSRV from M0, review reusable earlier
-SDK work, and review public traits/private payload URNs. Before M2, select bounded
-acceptance connectors, publish the schema subset, confirm artifact names, and
-assign release/runtime maintainers. Before production claims, reevaluate upstream
+SDK work, and review public traits/private payload URNs. Before optional M2
+distribution, select native acceptance connectors, confirm artifact names, and
+assign release/runtime maintainers. A portable schema subset and foreign
+connector tests are needed only if cross-language features are selected. Before
+production claims, reevaluate upstream
 RPC maturity and run distributed failure/recovery tests. These are implementation
 gates, not claims of completed support.

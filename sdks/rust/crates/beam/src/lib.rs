@@ -32,6 +32,7 @@
 
 mod graph;
 mod harness;
+mod io;
 mod job;
 mod metrics;
 mod registry;
@@ -39,8 +40,8 @@ mod values;
 
 pub use graph::{PCollection, Pipeline, SumI64};
 pub use job::{CounterResult, Job, JobOptions};
-pub use registry::{Application, BeamConfig, DoFn, ProcessContext};
-pub use values::{BeamValue, Bytes, Kv};
+pub use registry::{Application, BeamConfig, DoFn, FinishContext, ProcessContext};
+pub use values::{BeamValue, Bytes, Grouped, Kv};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

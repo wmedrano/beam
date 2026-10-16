@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::registry::{BeamConfig, DoFn, Registry};
-use crate::{BeamValue, Bytes, Job, JobOptions, Kv, Result, error};
+use crate::{BeamValue, Bytes, Grouped, Job, JobOptions, Kv, Result, error};
 use beam_coders::{Coder, Context, Value};
 use beam_model as model;
 use protobuf::prelude::*;
@@ -237,6 +237,30 @@ impl<'a> Pipeline<'a> {
         self.builtin(name, CREATE, &impulse.id, T::coder(), config)
     }
 
+    /// Read UTF-8 lines on local workers. Paths are made absolute on the driver;
+    /// workers must share its filesystem. CRLF and an unterminated last line
+    /// are accepted. This source does not split files or watch for new data.
+    pub fn read_text(&mut self, name: &str, paths: Vec<String>) -> Result<PCollection<String>> {
+        let paths = paths
+            .into_iter()
+            .map(|path| absolute_path(&path))
+            .collect::<Result<Vec<_>>>()?;
+        let paths = self.create(&format!("{name}/Paths"), paths)?;
+        self.par_do::<crate::io::ReadText>(name, &paths, ())
+    }
+
+    /// Write unique local UTF-8 shards, returning their paths from bundle
+    /// finish. Newlines within elements are rejected. Retries may duplicate
+    /// shards; no distributed commit/finalization guarantee is provided.
+    pub fn write_text(
+        &mut self,
+        name: &str,
+        input: &PCollection<String>,
+        directory: &str,
+    ) -> Result<PCollection<String>> {
+        self.par_do::<crate::io::WriteText>(name, input, absolute_path(directory)?)
+    }
+
     pub fn par_do<F: DoFn>(
         &mut self,
         name: &str,
@@ -292,7 +316,7 @@ impl<'a> Pipeline<'a> {
         &mut self,
         name: &str,
         input: &PCollection<Kv<K, V>>,
-    ) -> Result<PCollection<Kv<K, Vec<V>>>> {
+    ) -> Result<PCollection<Kv<K, Grouped<V>>>> {
         self.check(input)?;
         if !K::coder().deterministic_key() {
             return Err(error("GroupByKey requires a deterministic key coder"));
@@ -302,7 +326,7 @@ impl<'a> Pipeline<'a> {
             "beam:transform:group_by_key:v1",
             vec![],
             std::slice::from_ref(&input.id),
-            Kv::<K, Vec<V>>::coder(),
+            Kv::<K, Grouped<V>>::coder(),
             false,
         )
     }
@@ -357,4 +381,14 @@ impl<'a> Pipeline<'a> {
     pub async fn submit(&self, endpoint: &str, options: JobOptions) -> Result<Job> {
         crate::job::submit(self.proto.clone(), endpoint, options).await
     }
+}
+
+fn absolute_path(path: &str) -> Result<String> {
+    if path.is_empty() {
+        return Err(error("text I/O path must not be empty"));
+    }
+    std::path::absolute(path)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| error("text I/O path must be UTF-8"))
 }

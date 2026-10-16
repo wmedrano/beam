@@ -32,11 +32,14 @@ use tonic::transport::{Channel, Endpoint};
 
 pub struct JobOptions {
     pub name: String,
+    /// Bounds each unary submission, metrics, or cancellation call.
+    pub rpc_timeout: Duration,
 }
 impl Default for JobOptions {
     fn default() -> Self {
         Self {
             name: "rust-beam".to_owned(),
+            rpc_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -61,6 +64,7 @@ pub(crate) async fn connect(endpoint: &str) -> Result<Channel> {
 pub struct Job {
     client: JobServiceClient,
     pub id: String,
+    rpc_timeout: Duration,
 }
 
 pub(crate) async fn submit(
@@ -68,21 +72,35 @@ pub(crate) async fn submit(
     endpoint: &str,
     options: JobOptions,
 ) -> Result<Job> {
+    if options.name.is_empty() || options.rpc_timeout.is_zero() {
+        return Err(error("job name and RPC timeout must be nonempty"));
+    }
     let mut client = JobServiceClient::new(connect(endpoint).await?);
     let mut prepare = model::PrepareJobRequest::new();
     prepare.set_pipeline(pipeline);
     prepare.set_job_name(options.name);
     prepare.pipeline_options_mut();
-    let prepared = client.prepare(prepare).await?.into_inner();
+    let prepared = tokio::time::timeout(
+        options.rpc_timeout,
+        client.prepare(timed_request(prepare, options.rpc_timeout)),
+    )
+    .await??
+    .into_inner();
     let mut request = model::RunJobRequest::new();
     request.set_preparation_id(prepared.preparation_id());
     request.set_retrieval_token(
         model::urns::COMMIT_MANIFEST_RESPONSE_CONSTANTS_NO_ARTIFACTS_STAGED_TOKEN,
     );
-    let response = client.run(request).await?.into_inner();
+    let response = tokio::time::timeout(
+        options.rpc_timeout,
+        client.run(timed_request(request, options.rpc_timeout)),
+    )
+    .await??
+    .into_inner();
     Ok(Job {
         client,
         id: response.job_id().to_string(),
+        rpc_timeout: options.rpc_timeout,
     })
 }
 
@@ -90,7 +108,13 @@ impl Job {
     pub async fn counters(&mut self) -> Result<Vec<CounterResult>> {
         let mut request = model::GetJobMetricsRequest::new();
         request.set_job_id(&self.id);
-        let response = self.client.get_job_metrics(request).await?.into_inner();
+        let response = tokio::time::timeout(
+            self.rpc_timeout,
+            self.client
+                .get_job_metrics(timed_request(request, self.rpc_timeout)),
+        )
+        .await??
+        .into_inner();
         let mut results = Vec::new();
         for (committed, infos) in [
             (false, response.metrics().attempted()),
@@ -122,7 +146,11 @@ impl Job {
     pub async fn cancel(&mut self) -> Result<()> {
         let mut request = model::CancelJobRequest::new();
         request.set_job_id(&self.id);
-        self.client.cancel(request).await?;
+        tokio::time::timeout(
+            self.rpc_timeout,
+            self.client.cancel(timed_request(request, self.rpc_timeout)),
+        )
+        .await??;
         Ok(())
     }
     pub async fn wait(&mut self, duration: Duration) -> Result<()> {
@@ -164,4 +192,10 @@ impl Job {
             }
         }
     }
+}
+
+fn timed_request<T>(value: T, timeout: Duration) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(value);
+    request.set_timeout(timeout);
+    request
 }

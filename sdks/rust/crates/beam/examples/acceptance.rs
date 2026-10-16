@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use apache_beam::{Application, BeamConfig, Bytes, DoFn, Kv, ProcessContext, Result, SumI64};
+use apache_beam::{
+    Application, BeamConfig, Bytes, DoFn, Grouped, Kv, ProcessContext, Result, SumI64,
+};
 
 struct Mode(String);
 impl BeamConfig for Mode {
@@ -71,7 +73,7 @@ impl DoFn for Lifecycle {
         }
         context.emit(*value)
     }
-    fn finish_bundle(&mut self) -> Result<()> {
+    fn finish_bundle(&mut self, _context: &mut apache_beam::FinishContext<'_, i64>) -> Result<()> {
         assert_eq!(self.phase, 2);
         self.phase = 3;
         if self.mode == "finish_fail" {
@@ -99,7 +101,7 @@ impl DoFn for GenerateBytes {
 }
 struct ByteLengths;
 impl DoFn for ByteLengths {
-    type Input = Kv<i64, Vec<Bytes>>;
+    type Input = Kv<i64, Grouped<Bytes>>;
     type Output = i64;
     type Config = ();
     fn from_config(_: ()) -> Result<Self> {
@@ -110,7 +112,8 @@ impl DoFn for ByteLengths {
         value: &Self::Input,
         context: &mut ProcessContext<'_, i64>,
     ) -> Result<()> {
-        for bytes in &value.value {
+        for bytes in value.value.iter()? {
+            let bytes = bytes?;
             assert!(bytes.0.iter().all(|byte| *byte == 42));
             context.emit(i64::try_from(bytes.0.len())?)?;
         }
@@ -143,6 +146,44 @@ impl DoFn for SplitWords {
     }
 }
 
+struct BufferedSum(i64);
+impl DoFn for BufferedSum {
+    type Input = i64;
+    type Output = i64;
+    type Config = ();
+    fn from_config(_: ()) -> Result<Self> {
+        Ok(Self(0))
+    }
+    fn process(&mut self, value: &i64, _: &mut ProcessContext<'_, i64>) -> Result<()> {
+        self.0 = self.0.wrapping_add(*value);
+        Ok(())
+    }
+    fn finish_bundle(&mut self, context: &mut apache_beam::FinishContext<'_, i64>) -> Result<()> {
+        context.log("Emitting buffered sum during finish")?;
+        context.emit(self.0, 1234)
+    }
+}
+
+struct FirstInGroup;
+impl DoFn for FirstInGroup {
+    type Input = Kv<i64, Grouped<i64>>;
+    type Output = i64;
+    type Config = ();
+    fn from_config(_: ()) -> Result<Self> {
+        Ok(Self)
+    }
+    fn process(
+        &mut self,
+        input: &Self::Input,
+        context: &mut ProcessContext<'_, i64>,
+    ) -> Result<()> {
+        let mut values = input.value.iter()?;
+        assert_eq!(values.next().transpose()?, Some(input.key));
+        // Deliberately leave the remainder unread.
+        context.emit(input.key)
+    }
+}
+
 fn main() -> Result<()> {
     let case = std::env::args()
         .find_map(|arg| arg.strip_prefix("--case=").map(str::to_owned))
@@ -157,6 +198,8 @@ fn main() -> Result<()> {
         .register_dofn::<Lifecycle>("example:lifecycle:v1")?
         .register_dofn::<GenerateBytes>("example:generate_bytes:v1")?
         .register_dofn::<ByteLengths>("example:byte_lengths:v1")?
+        .register_dofn::<BufferedSum>("example:buffered_sum:v1")?
+        .register_dofn::<FirstInGroup>("example:first_in_group:v1")?
         .run_from_env(|p| {
             let lines = if ["fail", "panic"].contains(&case.as_str()) {
                 vec![format!("__{case}__")]
@@ -231,16 +274,34 @@ fn main() -> Result<()> {
             let lifecycle =
                 p.par_do::<Lifecycle>("Lifecycle", &lifecycle_input, Mode(case.clone()))?;
             p.assert_contents("Lifecycle result", &lifecycle, vec![17])?;
-            if case == "large" {
-                let lengths = p.create("Byte lengths", vec![2_i64 * 1024 * 1024; 3])?;
+            if case == "large" || case == "hot_group" {
+                let count = if case == "hot_group" { 40 } else { 3 };
+                let lengths = p.create("Byte lengths", vec![2_i64 * 1024 * 1024; count])?;
                 let bytes = p.par_do::<GenerateBytes>("Generate bytes", &lengths, ())?;
                 let grouped = p.group_by_key("Shuffle large elements", &bytes)?;
                 let lengths = p.par_do::<ByteLengths>("Verify bytes", &grouped, ())?;
                 p.assert_contents(
                     "Transferred lengths",
                     &lengths,
-                    vec![2_i64 * 1024 * 1024; 3],
+                    vec![2_i64 * 1024 * 1024; count],
                 )?;
+            }
+            if case == "partial_group" {
+                let input = p.create(
+                    "Grouped integers",
+                    (0..3)
+                        .flat_map(|key| std::iter::repeat_n(Kv::new(key, key), 100))
+                        .collect(),
+                )?;
+                let grouped = p.group_by_key("Group integers", &input)?;
+                let first = p.par_do::<FirstInGroup>("Read only one value", &grouped, ())?;
+                p.assert_contents("Partial consumption result", &first, vec![0, 1, 2])?;
+            }
+            if case == "finish_emit" {
+                let input = p.create("Buffered integers", vec![1_i64, 2, 3])?;
+                let first = p.par_do::<BufferedSum>("Buffer upstream", &input, ())?;
+                let second = p.par_do::<BufferedSum>("Buffer downstream", &first, ())?;
+                p.assert_contents("Finish result", &second, vec![6])?;
             }
             Ok(())
         })

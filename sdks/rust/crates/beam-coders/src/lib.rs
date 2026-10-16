@@ -17,6 +17,10 @@
 //! of protobuf RPC messages. Limits are checked before allocating from lengths.
 
 use std::fmt;
+use std::io::Read;
+
+mod grouped;
+pub use grouped::{Iterable, SpoolBudget, Values};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Context {
@@ -49,9 +53,14 @@ pub enum Value {
     F64(f64),
     Kv(Box<Value>, Box<Value>),
     Iterable(Vec<Value>),
+    /// Reiterable, disk-backed elements decoded one at a time.
+    Spool(Iterable),
     Nullable(Option<Box<Value>>),
     GlobalWindow,
-    IntervalWindow { end: i64, span: i64 },
+    IntervalWindow {
+        end: i64,
+        span: i64,
+    },
     Windowed(Box<WindowedValue>),
 }
 
@@ -115,6 +124,7 @@ pub enum Error {
     Invalid(&'static str),
     Limit(&'static str),
     TypeMismatch,
+    Io(String),
 }
 
 impl fmt::Display for Error {
@@ -124,6 +134,7 @@ impl fmt::Display for Error {
             Self::Invalid(reason) => write!(f, "invalid Beam encoding: {reason}"),
             Self::Limit(reason) => write!(f, "Beam coder resource limit: {reason}"),
             Self::TypeMismatch => write!(f, "value does not match its Beam coder"),
+            Self::Io(message) => write!(f, "Beam spool I/O: {message}"),
         }
     }
 }
@@ -134,18 +145,44 @@ struct Input<'a> {
     offset: usize,
     limits: Limits,
     items: usize,
+    reader: Option<&'a mut dyn Read>,
+    spooling: Option<Spooling<'a>>,
+}
+
+struct Spooling<'a> {
+    create: &'a mut dyn FnMut() -> std::io::Result<std::fs::File>,
+    budget: SpoolBudget,
 }
 
 impl<'a> Input<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+    fn take(&mut self, length: usize) -> Result<Vec<u8>, Error> {
         let end = self
             .offset
             .checked_add(length)
             .ok_or(Error::Invalid("length overflow"))?;
-        if end > self.limits.bytes {
+        let maximum = self
+            .spooling
+            .as_ref()
+            .map_or(self.limits.bytes, |s| s.budget.maximum());
+        if end > maximum {
             return Err(Error::Limit("element bytes"));
         }
-        let bytes = self.bytes.get(self.offset..end).ok_or(Error::NeedMore)?;
+        let bytes = if let Some(reader) = &mut self.reader {
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).map_err(|failure| {
+                if failure.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Error::NeedMore
+                } else {
+                    Error::Io(failure.to_string())
+                }
+            })?;
+            bytes
+        } else {
+            self.bytes
+                .get(self.offset..end)
+                .ok_or(Error::NeedMore)?
+                .to_vec()
+        };
         self.offset = end;
         Ok(bytes)
     }
@@ -262,9 +299,32 @@ impl Coder {
             offset: 0,
             limits,
             items: 0,
+            reader: None,
+            spooling: None,
         };
         let value = self.read(&mut input, context, limits.depth)?;
         Ok((value, input.offset))
+    }
+
+    /// Decode a complete nested element from a stream. Iterable contents are
+    /// validated and spooled before the value is exposed to user code. The
+    /// budget is shared across live groups, including retained/fan-out values.
+    pub fn read_spooled(
+        &self,
+        reader: &mut dyn Read,
+        create: &mut dyn FnMut() -> std::io::Result<std::fs::File>,
+        budget: SpoolBudget,
+        limits: Limits,
+    ) -> Result<Value, Error> {
+        let mut input = Input {
+            bytes: &[],
+            offset: 0,
+            limits,
+            items: 0,
+            reader: Some(reader),
+            spooling: Some(Spooling { create, budget }),
+        };
+        self.read(&mut input, Context::Nested, limits.depth)
     }
 
     fn write(
@@ -277,14 +337,23 @@ impl Coder {
         if depth == 0 {
             return Err(Error::Limit("coder depth"));
         }
+        if out.len() > Limits::default().bytes {
+            return Err(Error::Limit("output element bytes"));
+        }
         match (self, value) {
             (Self::Bytes, Value::Bytes(bytes)) => {
+                if bytes.len() > Limits::default().bytes {
+                    return Err(Error::Limit("output bytes"));
+                }
                 if context == Context::Nested {
                     varint(bytes.len() as u64, out);
                 }
                 out.extend_from_slice(bytes);
             }
             (Self::Utf8, Value::String(string)) => {
+                if string.len() > Limits::default().bytes {
+                    return Err(Error::Limit("output string bytes"));
+                }
                 if context == Context::Nested {
                     varint(string.len() as u64, out);
                 }
@@ -303,6 +372,16 @@ impl Coder {
                 out.extend_from_slice(&length.to_be_bytes());
                 for item in items {
                     coder.write(item, Context::Nested, out, depth - 1)?;
+                }
+            }
+            (Self::Iterable(coder), Value::Spool(items)) => {
+                out.extend_from_slice(
+                    &i32::try_from(items.len())
+                        .map_err(|_| Error::Limit("iterable length"))?
+                        .to_be_bytes(),
+                );
+                for item in items.iter()? {
+                    coder.write(&item?, Context::Nested, out, depth - 1)?;
                 }
             }
             (Self::Nullable(_), Value::Nullable(None)) => out.push(0),
@@ -339,6 +418,9 @@ impl Coder {
             }
             _ => return Err(Error::TypeMismatch),
         }
+        if out.len() > Limits::default().bytes {
+            return Err(Error::Limit("output element bytes"));
+        }
         Ok(())
     }
 
@@ -351,16 +433,17 @@ impl Coder {
                 let length = if context == Context::Nested {
                     input.length()?
                 } else {
+                    if input.reader.is_some() {
+                        return Err(Error::Invalid("unframed outer bytes in stream"));
+                    }
                     input.bytes.len() - input.offset
                 };
                 let bytes = input.take(length)?;
                 if *self == Self::Bytes {
-                    Ok(Value::Bytes(bytes.to_vec()))
+                    Ok(Value::Bytes(bytes))
                 } else {
                     Ok(Value::String(
-                        std::str::from_utf8(bytes)
-                            .map_err(|_| Error::Invalid("UTF-8"))?
-                            .to_owned(),
+                        String::from_utf8(bytes).map_err(|_| Error::Invalid("UTF-8"))?,
                     ))
                 }
             }
@@ -390,10 +473,12 @@ impl Coder {
                 let length = input.length()?;
                 let bytes = input.take(length)?;
                 let mut nested = Input {
-                    bytes,
+                    bytes: &bytes,
                     offset: 0,
                     limits: input.limits,
                     items: input.items,
+                    reader: None,
+                    spooling: None,
                 };
                 let result = coder.read(&mut nested, Context::Outer, depth - 1)?;
                 input.items = nested.items;
@@ -408,10 +493,25 @@ impl Coder {
                     return Err(Error::Invalid("negative iterable length"));
                 }
                 let mut items = Vec::new();
+                let mut spool = if let Some(spooling) = &mut input.spooling {
+                    Some(grouped::Builder::new(
+                        (spooling.create)().map_err(|e| Error::Io(e.to_string()))?,
+                        coder.as_ref().clone(),
+                        spooling.budget.clone(),
+                        input.limits,
+                    ))
+                } else {
+                    None
+                };
                 if length >= 0 {
                     input.count(length as usize)?;
                     for _ in 0..length {
-                        items.push(coder.read(input, Context::Nested, depth - 1)?);
+                        let item = coder.read(input, Context::Nested, depth - 1)?;
+                        if let Some(spool) = &mut spool {
+                            spool.push(&item)?;
+                        } else {
+                            items.push(item);
+                        }
                     }
                 } else {
                     loop {
@@ -426,11 +526,20 @@ impl Coder {
                             usize::try_from(count).map_err(|_| Error::Limit("block count"))?;
                         input.count(count)?;
                         for _ in 0..count {
-                            items.push(coder.read(input, Context::Nested, depth - 1)?);
+                            let item = coder.read(input, Context::Nested, depth - 1)?;
+                            if let Some(spool) = &mut spool {
+                                spool.push(&item)?;
+                            } else {
+                                items.push(item);
+                            }
                         }
                     }
                 }
-                Ok(Value::Iterable(items))
+                if let Some(spool) = spool {
+                    Ok(Value::Spool(spool.finish()?))
+                } else {
+                    Ok(Value::Iterable(items))
+                }
             }
             Self::GlobalWindow => Ok(Value::GlobalWindow),
             Self::IntervalWindow => {

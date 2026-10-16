@@ -59,7 +59,7 @@ pub trait DoFn: Send + Sized + 'static {
         input: &Self::Input,
         context: &mut ProcessContext<'_, Self::Output>,
     ) -> Result<()>;
-    fn finish_bundle(&mut self) -> Result<()> {
+    fn finish_bundle(&mut self, _context: &mut FinishContext<'_, Self::Output>) -> Result<()> {
         Ok(())
     }
     fn teardown(&mut self) -> Result<()> {
@@ -70,6 +70,7 @@ pub trait DoFn: Send + Sized + 'static {
 pub struct ProcessContext<'a, T> {
     emit: &'a mut dyn FnMut(Value) -> Result<()>,
     counter: &'a mut dyn FnMut(&str, i64) -> Result<()>,
+    log: &'a mut dyn FnMut(&str) -> Result<()>,
     marker: PhantomData<T>,
 }
 impl<T: BeamValue> ProcessContext<'_, T> {
@@ -80,6 +81,30 @@ impl<T: BeamValue> ProcessContext<'_, T> {
     pub fn counter(&mut self, name: &str, delta: i64) -> Result<()> {
         (self.counter)(name, delta)
     }
+    /// Send an INFO entry through Fn Logging with bundle/transform context.
+    pub fn log(&mut self, message: &str) -> Result<()> {
+        (self.log)(message)
+    }
+}
+
+/// Finish outputs require an explicit event timestamp (milliseconds since the
+/// Unix epoch). The prototype supports only the global window.
+pub struct FinishContext<'a, T> {
+    emit: &'a mut dyn FnMut(Value, i64) -> Result<()>,
+    counter: &'a mut dyn FnMut(&str, i64) -> Result<()>,
+    log: &'a mut dyn FnMut(&str) -> Result<()>,
+    marker: PhantomData<T>,
+}
+impl<T: BeamValue> FinishContext<'_, T> {
+    pub fn emit(&mut self, value: T, timestamp: i64) -> Result<()> {
+        (self.emit)(value.into_value(), timestamp)
+    }
+    pub fn counter(&mut self, name: &str, delta: i64) -> Result<()> {
+        (self.counter)(name, delta)
+    }
+    pub fn log(&mut self, message: &str) -> Result<()> {
+        (self.log)(message)
+    }
 }
 
 pub(crate) trait Processor: Send {
@@ -89,8 +114,14 @@ pub(crate) trait Processor: Send {
         input: &Value,
         emit: &mut dyn FnMut(Value) -> Result<()>,
         counter: &mut dyn FnMut(&str, i64) -> Result<()>,
+        log: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()>;
-    fn finish(&mut self) -> Result<()>;
+    fn finish(
+        &mut self,
+        emit: &mut dyn FnMut(Value, i64) -> Result<()>,
+        counter: &mut dyn FnMut(&str, i64) -> Result<()>,
+        log: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()>;
 }
 struct Function<F: DoFn>(F);
 impl<F: DoFn> Drop for Function<F> {
@@ -110,18 +141,30 @@ impl<F: DoFn> Processor for Function<F> {
         input: &Value,
         emit: &mut dyn FnMut(Value) -> Result<()>,
         counter: &mut dyn FnMut(&str, i64) -> Result<()>,
+        log: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         self.0.process(
             &F::Input::from_value(input)?,
             &mut ProcessContext {
                 emit,
                 counter,
+                log,
                 marker: PhantomData,
             },
         )
     }
-    fn finish(&mut self) -> Result<()> {
-        self.0.finish_bundle()
+    fn finish(
+        &mut self,
+        emit: &mut dyn FnMut(Value, i64) -> Result<()>,
+        counter: &mut dyn FnMut(&str, i64) -> Result<()>,
+        log: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.0.finish_bundle(&mut FinishContext {
+            emit,
+            counter,
+            log,
+            marker: PhantomData,
+        })
     }
 }
 
@@ -234,6 +277,10 @@ impl Application {
                 ..Registry::default()
             },
         }
+        .register_dofn::<crate::io::ReadText>("beam:rust:stdlib:read_text:v1")
+        .expect("unique built-in text reader")
+        .register_dofn::<crate::io::WriteText>("beam:rust:stdlib:write_text:v1")
+        .expect("unique built-in text writer")
     }
     pub fn register_dofn<F: DoFn>(mut self, id: &str) -> Result<Self> {
         if id.is_empty()
@@ -286,7 +333,21 @@ impl Application {
             .ok_or_else(|| error("driver requires --endpoint=host:port"))?;
         runtime.block_on(async {
             let mut job = pipeline
-                .submit(endpoint, crate::JobOptions::default())
+                .submit(
+                    endpoint,
+                    crate::JobOptions {
+                        name: args
+                            .get("job_name")
+                            .cloned()
+                            .unwrap_or_else(|| "rust-beam".to_owned()),
+                        rpc_timeout: std::time::Duration::from_millis(
+                            args.get("rpc_timeout_ms")
+                                .map(|value| value.parse::<u64>())
+                                .transpose()?
+                                .unwrap_or(10_000),
+                        ),
+                    },
+                )
                 .await?;
             eprintln!("submitted job {}", job.id);
             let wait = args
