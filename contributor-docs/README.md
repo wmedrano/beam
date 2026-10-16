@@ -26,6 +26,7 @@ This directory contains documentation for contributors to the Apache Beam projec
 - [Python Tips](python-tips.md): Tips and instructions for developing the Python SDK, including environment setup, running tests, and handling dependencies.
 - [RC Testing Guide](rc-testing-guide.md): A guide for testing Beam Release Candidates (RCs) against downstream projects for Python, Java, and Go SDKs.
 - [Release Guide](release-guide.md): A comprehensive guide for the Release Manager on how to perform a Beam release, from preparation to promotion.
+- [Rust SDK Design](rust-sdk-design.md): A proposal for a native Rust SDK using Beam's portability APIs, with dependency choices, deployment, and validation milestones.
 - [Updating Supported Python Versions](updating-supported-python-versions.md): Instructions for adding support for new Python versions or removing support for end-of-life versions in Apache Beam.
 
 ## Discussion Documents

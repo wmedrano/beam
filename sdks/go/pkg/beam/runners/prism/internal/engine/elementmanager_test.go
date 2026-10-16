@@ -16,6 +16,7 @@
 package engine
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"fmt"
@@ -30,6 +31,63 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/typex"
 	"github.com/google/go-cmp/cmp"
 )
+
+func TestPersistBundleFragmentedData(t *testing.T) {
+	info := PColInfo{
+		GlobalID: "output",
+		WDec:     exec.MakeWindowDecoder(coder.NewGlobalWindow()),
+		WEnc:     exec.MakeWindowEncoder(coder.NewGlobalWindow()),
+		EDec: func(r io.Reader) []byte {
+			var encoded bytes.Buffer
+			tee := io.TeeReader(r, &encoded)
+			length, err := coder.DecodeVarInt(tee)
+			if err != nil || length < 0 || length > 1024 {
+				t.Fatalf("invalid test string length %v: %v", length, err)
+			}
+			if _, err := io.CopyN(io.Discard, tee, length); err != nil {
+				t.Fatal(err)
+			}
+			return encoded.Bytes()
+		},
+	}
+	values := elements{es: []element{
+		{window: window.GlobalWindow{}, timestamp: mtime.MinTimestamp, pane: typex.NoFiringPane(), elmBytes: []byte{1, 'a'}},
+		{window: window.GlobalWindow{}, timestamp: mtime.MinTimestamp, pane: typex.NoFiringPane(), elmBytes: []byte{2, 'b', 'c'}},
+	}, minTimestamp: mtime.MinTimestamp}
+	wire := bytes.Join(values.ToData(info), nil)
+	for split := 0; split <= len(wire)+1; split++ {
+		t.Run(fmt.Sprint(split), func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			em := NewElementManager(Config{})
+			em.AddStage("impulse", nil, []string{"input"}, nil)
+			em.AddStage("producer", []string{"input"}, []string{"output"}, nil)
+			em.AddStage("consumer", []string{"output"}, nil, nil)
+			em.Impulse("impulse")
+			var sequence int
+			bundles := em.Bundles(ctx, cancel, func() string { sequence++; return fmt.Sprint(sequence) })
+			producer := <-bundles
+			var data TentativeData
+			if split <= len(wire) {
+				data.WriteData("output", wire[:split])
+				data.WriteData("output", wire[split:])
+			} else {
+				for i := range wire {
+					data.WriteData("output", wire[i:i+1])
+				}
+			}
+			em.PersistBundle(producer, map[string]PColInfo{"output": info}, data, info, Residuals{})
+			consumer := <-bundles
+			if got := bytes.Join(em.InputForBundle(consumer, info), nil); !bytes.Equal(got, wire) {
+				t.Fatalf("got %v, want %v", got, wire)
+			}
+			em.PersistBundle(consumer, nil, TentativeData{}, info, Residuals{})
+			if _, ok := <-bundles; ok {
+				t.Fatal("unexpected additional bundle")
+			}
+		})
+	}
+}
 
 func TestElementHeap(t *testing.T) {
 	elements := elementHeap{

@@ -16,11 +16,34 @@
 package internal
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/prism/internal/urns"
 )
+
+func TestProcessCommandWorkerIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell")
+	}
+	command := filepath.Join(t.TempDir(), "worker executable")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"job-001[rust-beam]_rust", "worker with spaces", "worker's-id"} {
+		got, err := processCommand(context.Background(), command, id, "localhost:1234").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "--id=" + id + "\n--provision_endpoint=localhost:1234\n"; string(got) != want {
+			t.Fatalf("worker received %q, want %q", got, want)
+		}
+	}
+}
 
 func TestSelectAnyOf(t *testing.T) {
 	tests := []struct {

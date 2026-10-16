@@ -1,0 +1,74 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: PreCommit Rust
+on:
+  pull_request:
+    branches: ['master', 'release-*']
+    paths: ['sdks/rust/**', 'model/**', 'sdks/go/pkg/beam/runners/prism/**', 'sdks/go.mod', 'sdks/go.sum', '.github/workflows/beam_PreCommit_Rust.yml']
+  push:
+    branches: ['master', 'release-*']
+    paths: ['sdks/rust/**', 'model/**', 'sdks/go/pkg/beam/runners/prism/**', 'sdks/go.mod', 'sdks/go.sum', '.github/workflows/beam_PreCommit_Rust.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  rust-prism:
+    runs-on: [self-hosted, ubuntu-24.04, main]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-environment-action
+        with:
+          go-version: default
+          python-version: default
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/beam-rustup-init.sh
+            sh /tmp/beam-rustup-init.sh -y --profile minimal --default-toolchain 1.96.1
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.96.1 --profile minimal --component rustfmt,clippy
+      - name: Cargo checks
+        working-directory: sdks/rust
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+      - name: Regeneration check
+        run: |
+          python3 -m venv sdks/rust/.tools/python
+          sdks/rust/.tools/python/bin/pip install -r sdks/rust/tools/requirements.txt
+          python3 sdks/rust/tools/bootstrap-protocol-tools.py
+          sdks/rust/.tools/python/bin/python sdks/rust/tools/generate.py --check --protoc sdks/rust/.tools/protoc/bin/protoc --plugin sdks/rust/.tools/grpc/bin/protoc-gen-rust-grpc --include sdks/rust/.tools/protoc/include
+      - name: Go protocol interoperability and TLS
+        run: bash sdks/rust/tools/test-interop.sh
+      - name: Prism PROCESS acceptance
+        run: bash sdks/rust/tools/test-prism.sh
+      - name: Standalone packaged crates
+        run: python3 sdks/rust/tools/test-packages.py
+      - name: Dependency metadata inventory
+        run: python3 sdks/rust/tools/dependencies.py --check
